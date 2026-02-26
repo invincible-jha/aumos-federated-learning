@@ -1,0 +1,77 @@
+version: "3.9"
+
+services:
+  federated-learning:
+    build: .
+    ports:
+      - "8005:8000"
+      - "9091:9091"
+    env_file:
+      - .env.example
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://aumos:aumos@postgres:5432/aumos_federated_learning
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_URL=redis://redis:6379/0
+      - PRIVACY_ENGINE_URL=http://privacy-engine:8000
+      - MODEL_REGISTRY_URL=http://model-registry:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src:ro
+      - fl_models:/tmp/aumos_fl_models
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aumos
+      POSTGRES_PASSWORD: aumos
+      POSTGRES_DB: aumos_federated_learning
+    ports:
+      - "5437:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aumos"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6384:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    depends_on:
+      - zookeeper
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+volumes:
+  postgres_data:
+  fl_models:
