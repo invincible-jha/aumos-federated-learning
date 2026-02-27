@@ -16,9 +16,15 @@ from aumos_federated_learning.core.interfaces import (
     AggregatorProtocol,
     CoordinatorProtocol,
     DPAggregatorProtocol,
+    DropoutHandlerProtocol,
+    FLDashboardProtocol,
     FLStrategyProtocol,
+    IncentiveScorerProtocol,
+    ModelVersionerProtocol,
+    ParticipantRegistryProtocol,
     SecureAggregationProtocol,
     SyntheticFallbackProtocol,
+    ValidationRunnerProtocol,
 )
 from aumos_federated_learning.core.models import AggregationRound, FederatedJob, Participant
 
@@ -549,3 +555,553 @@ class MetricsService:
             return {}
 
         return {pid: samples / total for pid, samples in participant_samples.items()}
+
+
+# ---------------------------------------------------------------------------
+# Participant Registry Service
+# ---------------------------------------------------------------------------
+
+
+class ParticipantRegistryService:
+    """Orchestrate participant enrollment, liveness, and round assignment.
+
+    Wraps the ParticipantRegistryProtocol adapter with business-rule
+    validation: enforces that participants belong to the correct job/tenant
+    before delegation.
+    """
+
+    def __init__(
+        self,
+        registry: ParticipantRegistryProtocol,
+        job_repository: Any,
+    ) -> None:
+        self._registry = registry
+        self._job_repo = job_repository
+
+    async def enroll_participant(
+        self,
+        *,
+        job_id: uuid.UUID,
+        tenant_id: str,
+        organization_id: str,
+        capabilities: dict[str, Any],
+    ) -> str:
+        """Validate job existence then enroll the participant node.
+
+        Args:
+            job_id: The federated job this participant is joining.
+            tenant_id: Tenant context for row-level security.
+            organization_id: Enrolling organization's unique identifier.
+            capabilities: Declared hardware and data capabilities.
+
+        Returns:
+            Assigned participant_id UUID string.
+
+        Raises:
+            ValueError: If the job does not exist in this tenant.
+        """
+        job = await self._job_repo.get_by_id(job_id, tenant_id=tenant_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} not found for tenant {tenant_id}")
+
+        participant_id = await self._registry.register_participant(
+            job_id=str(job_id),
+            organization_id=organization_id,
+            capabilities=capabilities,
+        )
+        logger.info(
+            "Enrolled participant %s for job %s (org=%s)",
+            participant_id,
+            job_id,
+            organization_id,
+        )
+        return participant_id
+
+    async def heartbeat(self, participant_id: str) -> bool:
+        """Record a heartbeat and return current liveness status.
+
+        Args:
+            participant_id: The participant pinging in.
+
+        Returns:
+            True if participant is considered alive after the heartbeat.
+        """
+        await self._registry.record_heartbeat(participant_id)
+        return await self._registry.check_liveness(participant_id)
+
+    async def select_participants_for_round(
+        self,
+        job_id: uuid.UUID,
+        round_number: int,
+        *,
+        require_gpu: bool = False,
+        min_dataset_size: int = 0,
+        min_bandwidth_mbps: float = 0.0,
+    ) -> list[str]:
+        """Find eligible participants and assign them to a round.
+
+        Args:
+            job_id: The federated job.
+            round_number: The upcoming training round.
+            require_gpu: If True, filter to GPU-equipped participants.
+            min_dataset_size: Minimum samples required.
+            min_bandwidth_mbps: Minimum upload bandwidth required.
+
+        Returns:
+            List of assigned participant_ids.
+        """
+        eligible = await self._registry.find_eligible_participants(
+            str(job_id),
+            require_gpu=require_gpu,
+            min_dataset_size=min_dataset_size,
+            min_bandwidth_mbps=min_bandwidth_mbps,
+        )
+
+        if eligible:
+            await self._registry.assign_to_round(
+                str(job_id), round_number, eligible
+            )
+
+        return eligible
+
+    async def perform_liveness_sweep(self, job_id: uuid.UUID) -> list[str]:
+        """Sweep all participants for the job and mark timed-out nodes as dropped.
+
+        Args:
+            job_id: The federated job to sweep.
+
+        Returns:
+            List of newly dropped participant_ids.
+        """
+        return await self._registry.sweep_dropped_participants(str(job_id))
+
+
+# ---------------------------------------------------------------------------
+# Validation Service
+# ---------------------------------------------------------------------------
+
+
+class ValidationService:
+    """Orchestrate central validation and early stopping across rounds.
+
+    Wraps ValidationRunnerProtocol with job-scoped context and integrates
+    with the job repository for status transitions on convergence.
+    """
+
+    def __init__(
+        self,
+        validation_runner: ValidationRunnerProtocol,
+        job_repository: Any,
+    ) -> None:
+        self._runner = validation_runner
+        self._job_repo = job_repository
+
+    async def evaluate_and_check_stopping(
+        self,
+        job_id: uuid.UUID,
+        tenant_id: str,
+        round_number: int,
+        parameters: list[Any],
+        training_metrics: dict[str, float] | None = None,
+        early_stopping_patience: int = 5,
+    ) -> dict[str, Any]:
+        """Evaluate the global model and check whether training should stop.
+
+        Runs central validation, checks convergence and early stopping, and
+        transitions the job to 'complete' status if stopping is warranted.
+
+        Args:
+            job_id: The federated job.
+            tenant_id: Tenant context.
+            round_number: The just-completed round.
+            parameters: Global model weight arrays.
+            training_metrics: Optional training-phase metrics dict.
+            early_stopping_patience: Rounds of no improvement before stopping.
+
+        Returns:
+            Dict with keys: validation_result, should_stop, reason.
+        """
+        result = await self._runner.evaluate_round(
+            job_id=str(job_id),
+            round_number=round_number,
+            parameters=parameters,
+            training_metrics=training_metrics,
+        )
+
+        should_stop = False
+        reason: str | None = None
+
+        if result.converged:
+            should_stop = True
+            reason = "convergence_detected"
+        elif self._runner.check_early_stopping(str(job_id), patience=early_stopping_patience):
+            should_stop = True
+            reason = "early_stopping_patience_exceeded"
+
+        if should_stop:
+            logger.info(
+                "Training stopping for job %s round %d: %s",
+                job_id,
+                round_number,
+                reason,
+            )
+
+        return {
+            "validation_result": result,
+            "should_stop": should_stop,
+            "reason": reason,
+        }
+
+    async def get_validation_report(
+        self,
+        job_id: uuid.UUID,
+        tenant_id: str,
+    ) -> dict[str, Any]:
+        """Generate and return a full validation report for a job.
+
+        Args:
+            job_id: The federated job.
+            tenant_id: Tenant context (used to verify job access).
+
+        Returns:
+            Validation report dict.
+
+        Raises:
+            ValueError: If the job is not found.
+        """
+        job = await self._job_repo.get_by_id(job_id, tenant_id=tenant_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} not found")
+
+        return await self._runner.generate_validation_report(str(job_id))
+
+
+# ---------------------------------------------------------------------------
+# Round Orchestration Service
+# ---------------------------------------------------------------------------
+
+
+class RoundOrchestrationService:
+    """Orchestrate a full training round lifecycle including dropout handling.
+
+    Coordinates DropoutHandler, ParticipantRegistry, and TrainingService to
+    manage round start, straggler detection, partial aggregation decisions,
+    and round completion recording.
+    """
+
+    def __init__(
+        self,
+        dropout_handler: DropoutHandlerProtocol,
+        participant_registry: ParticipantRegistryProtocol,
+        round_repository: Any,
+    ) -> None:
+        self._dropout_handler = dropout_handler
+        self._registry = participant_registry
+        self._round_repo = round_repository
+
+    def begin_round(
+        self,
+        job_id: uuid.UUID,
+        round_number: int,
+        participant_ids: list[str],
+        timeout_seconds: int = 3600,
+    ) -> None:
+        """Register dropout tracking for a new round.
+
+        Args:
+            job_id: The federated job.
+            round_number: The round being started.
+            participant_ids: Participants scheduled for this round.
+            timeout_seconds: Round deadline in seconds from now.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=timeout_seconds)
+        self._dropout_handler.register_round(
+            job_id=str(job_id),
+            round_number=round_number,
+            assigned_participant_ids=participant_ids,
+            deadline=deadline,
+        )
+        logger.info(
+            "Round orchestration started for job %s round %d (%d participants)",
+            job_id,
+            round_number,
+            len(participant_ids),
+        )
+
+    def record_participant_submission(
+        self,
+        job_id: uuid.UUID,
+        round_number: int,
+        participant_id: str,
+    ) -> None:
+        """Mark a participant update as received.
+
+        Args:
+            job_id: The federated job.
+            round_number: The round.
+            participant_id: The submitting participant.
+        """
+        self._dropout_handler.record_submission(
+            str(job_id), round_number, participant_id
+        )
+
+    async def resolve_round(
+        self,
+        job_id: uuid.UUID,
+        round_number: int,
+        min_participants: int,
+    ) -> dict[str, Any]:
+        """Determine round resolution strategy after the deadline.
+
+        Checks timeouts, evaluates quorum, and returns the set of
+        participant updates to include in aggregation.
+
+        Args:
+            job_id: The federated job.
+            round_number: The round to resolve.
+            min_participants: Absolute minimum participants required.
+
+        Returns:
+            Dict with keys: participant_ids_for_aggregation, partial_aggregation,
+            dropped_participant_ids, quorum_met.
+        """
+        dropped = await self._dropout_handler.detect_timeouts(str(job_id), round_number)
+        quorum_met = self._dropout_handler.check_quorum(str(job_id), round_number)
+
+        if not quorum_met:
+            return {
+                "participant_ids_for_aggregation": [],
+                "partial_aggregation": False,
+                "dropped_participant_ids": dropped,
+                "quorum_met": False,
+            }
+
+        available = self._dropout_handler.trigger_partial_aggregation(
+            str(job_id), round_number
+        )
+
+        return {
+            "participant_ids_for_aggregation": available,
+            "partial_aggregation": len(dropped) > 0,
+            "dropped_participant_ids": dropped,
+            "quorum_met": True,
+        }
+
+    def get_dropout_stats(self, job_id: uuid.UUID) -> dict[str, Any]:
+        """Return dropout statistics for a job.
+
+        Args:
+            job_id: The federated job.
+
+        Returns:
+            Dropout statistics dict.
+        """
+        return self._dropout_handler.get_dropout_statistics(str(job_id))
+
+
+# ---------------------------------------------------------------------------
+# Incentive Service
+# ---------------------------------------------------------------------------
+
+
+class IncentiveService:
+    """Score participant contributions and distribute rewards after each round.
+
+    Integrates with IncentiveScorerProtocol to compute data quality scores,
+    Shapley value approximations, and reward allocations, and surfaces
+    free-rider detection for governance action.
+    """
+
+    def __init__(
+        self,
+        scorer: IncentiveScorerProtocol,
+        job_repository: Any,
+    ) -> None:
+        self._scorer = scorer
+        self._job_repo = job_repository
+
+    async def score_and_distribute(
+        self,
+        job_id: uuid.UUID,
+        tenant_id: str,
+        round_number: int,
+        participant_data: list[dict[str, Any]],
+        shapley_values: dict[str, float] | None = None,
+        model_improvement_attributions: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        """Score all participants for a round and return reward distribution.
+
+        Args:
+            job_id: The federated job.
+            tenant_id: Tenant context for access verification.
+            round_number: The completed training round.
+            participant_data: List of participant capability/submission metadata.
+            shapley_values: Pre-computed Shapley values if available.
+            model_improvement_attributions: Pre-computed improvement attributions.
+
+        Returns:
+            Dict with contribution_records, free_riders, reward_distribution.
+
+        Raises:
+            ValueError: If the job is not found for this tenant.
+        """
+        job = await self._job_repo.get_by_id(job_id, tenant_id=tenant_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} not found for tenant {tenant_id}")
+
+        records = await self._scorer.score_round(
+            job_id=str(job_id),
+            round_number=round_number,
+            participant_data=participant_data,
+            shapley_values=shapley_values,
+            model_improvement_attributions=model_improvement_attributions,
+        )
+
+        free_riders = [r.participant_id for r in records if r.is_free_rider]
+        reward_distribution = {r.participant_id: r.reward_units for r in records}
+
+        logger.info(
+            "Incentive distribution for job %s round %d: "
+            "%d participants, %d free-riders",
+            job_id,
+            round_number,
+            len(records),
+            len(free_riders),
+        )
+
+        return {
+            "contribution_records": [r.to_dict() for r in records],
+            "free_riders": free_riders,
+            "reward_distribution": reward_distribution,
+        }
+
+    async def get_distribution_report(
+        self, job_id: uuid.UUID, tenant_id: str
+    ) -> dict[str, Any]:
+        """Return the incentive distribution report for an entire job.
+
+        Args:
+            job_id: The federated job.
+            tenant_id: Tenant context.
+
+        Returns:
+            Report dict from IncentiveScorer.
+
+        Raises:
+            ValueError: If the job is not found.
+        """
+        job = await self._job_repo.get_by_id(job_id, tenant_id=tenant_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} not found for tenant {tenant_id}")
+
+        return await self._scorer.generate_distribution_report(job_id=str(job_id))
+
+
+# ---------------------------------------------------------------------------
+# Dashboard Service
+# ---------------------------------------------------------------------------
+
+
+class DashboardService:
+    """Expose training progress aggregation for the monitoring layer.
+
+    Wraps FLDashboardProtocol with job-scoped access control, feeding
+    round start and completion events from the training and aggregation
+    services, and building full snapshots on demand.
+    """
+
+    def __init__(
+        self,
+        dashboard: FLDashboardProtocol,
+        job_repository: Any,
+    ) -> None:
+        self._dashboard = dashboard
+        self._job_repo = job_repository
+
+    def record_round_start(
+        self,
+        job_id: uuid.UUID,
+        round_number: int,
+        participant_ids: list[str],
+    ) -> None:
+        """Push round-start event into the dashboard.
+
+        Args:
+            job_id: The federated job.
+            round_number: The round being started.
+            participant_ids: Participants assigned to this round.
+        """
+        self._dashboard.ingest_round_start(
+            job_id=str(job_id),
+            round_number=round_number,
+            assigned_participants=participant_ids,
+        )
+
+    def record_round_completion(
+        self,
+        job_id: uuid.UUID,
+        round_number: int,
+        *,
+        participants_submitted: int,
+        participants_dropped: int,
+        loss: float | None = None,
+        accuracy: float | None = None,
+        dp_epsilon_consumed: float | None = None,
+        bytes_transmitted: int = 0,
+    ) -> None:
+        """Push round-completion event into the dashboard.
+
+        Args:
+            job_id: The federated job.
+            round_number: The completed round.
+            participants_submitted: Submission count.
+            participants_dropped: Dropout count.
+            loss: Validation loss.
+            accuracy: Validation accuracy.
+            dp_epsilon_consumed: Cumulative privacy budget consumed.
+            bytes_transmitted: Bytes of weights exchanged.
+        """
+        self._dashboard.ingest_round_completion(
+            job_id=str(job_id),
+            round_number=round_number,
+            participants_submitted=participants_submitted,
+            participants_dropped=participants_dropped,
+            loss=loss,
+            accuracy=accuracy,
+            dp_epsilon_consumed=dp_epsilon_consumed,
+            bytes_transmitted=bytes_transmitted,
+        )
+
+    async def get_snapshot(
+        self,
+        job_id: uuid.UUID,
+        tenant_id: str,
+        total_epsilon_budget: float | None = None,
+    ) -> dict[str, Any]:
+        """Build and return the full dashboard snapshot for a job.
+
+        Args:
+            job_id: The federated job.
+            tenant_id: Tenant context for access control.
+            total_epsilon_budget: Optional privacy budget cap for the job.
+
+        Returns:
+            Dashboard JSON snapshot.
+
+        Raises:
+            ValueError: If the job is not found.
+        """
+        job = await self._job_repo.get_by_id(job_id, tenant_id=tenant_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} not found for tenant {tenant_id}")
+
+        # Derive epsilon budget from job configuration if not provided
+        if total_epsilon_budget is None and job.dp_epsilon is not None:
+            total_epsilon_budget = float(job.dp_epsilon) * job.num_rounds
+
+        return await self._dashboard.export_dashboard_json(
+            job_id=str(job_id),
+            total_epsilon_budget=total_epsilon_budget,
+        )
