@@ -14,6 +14,8 @@ from typing import Any
 
 from aumos_federated_learning.core.interfaces import (
     AggregatorProtocol,
+    AsyncAggregatorProtocol,
+    CompressionProtocol,
     CoordinatorProtocol,
     DPAggregatorProtocol,
     DropoutHandlerProtocol,
@@ -24,6 +26,7 @@ from aumos_federated_learning.core.interfaces import (
     ParticipantRegistryProtocol,
     SecureAggregationProtocol,
     SyntheticFallbackProtocol,
+    TEEAttestationProtocol,
     ValidationRunnerProtocol,
 )
 from aumos_federated_learning.core.models import AggregationRound, FederatedJob, Participant
@@ -1105,3 +1108,219 @@ class DashboardService:
             job_id=str(job_id),
             total_epsilon_budget=total_epsilon_budget,
         )
+
+
+# ---------------------------------------------------------------------------
+# Simulation Service (Gap #146)
+# ---------------------------------------------------------------------------
+
+
+class SimulationService:
+    """Run in-process FL simulations for strategy comparison.
+
+    Wraps SimulationRunner with tenant context and audit logging.
+    """
+
+    def __init__(self, job_repository: Any) -> None:
+        self._job_repo = job_repository
+
+    async def run_simulation(
+        self,
+        *,
+        tenant_id: str,
+        strategy: str,
+        num_clients: int,
+        num_rounds: int,
+        fraction_fit: float,
+        dp_epsilon: float | None,
+        fedprox_mu: float,
+    ) -> Any:
+        """Execute a complete FL simulation and return results.
+
+        Args:
+            tenant_id: Tenant context for audit logging.
+            strategy: FL aggregation strategy (fedavg, fedprox, scaffold).
+            num_clients: Number of virtual participants.
+            num_rounds: Number of training rounds.
+            fraction_fit: Fraction of clients sampled per round.
+            dp_epsilon: Optional DP budget. None disables DP.
+            fedprox_mu: Proximal term weight for FedProx.
+
+        Returns:
+            SimulationResult with per-round metrics and final accuracy.
+        """
+        from aumos_federated_learning.adapters.simulation_runner import SimulationRunner  # noqa: PLC0415
+
+        runner = SimulationRunner(
+            strategy=strategy,  # type: ignore[arg-type]
+            num_clients=num_clients,
+            num_rounds=num_rounds,
+            fraction_fit=fraction_fit,
+            dp_epsilon=dp_epsilon,
+            fedprox_mu=fedprox_mu,
+        )
+
+        tenant_uuid = uuid.UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
+        result = await runner.run(tenant_uuid)
+
+        logger.info(
+            "Simulation complete for tenant %s — strategy=%s final_accuracy=%.4f",
+            tenant_id,
+            strategy,
+            result.final_accuracy,
+        )
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Async Aggregation Service (Gap #149)
+# ---------------------------------------------------------------------------
+
+
+class AsyncAggregationService:
+    """Manage asynchronous model update submission and staleness-weighted aggregation.
+
+    Wraps AsyncAggregatorProtocol with job-scoped lifecycle management.
+    """
+
+    def __init__(
+        self,
+        async_aggregator: AsyncAggregatorProtocol,
+        round_repository: Any,
+        storage: Any,
+    ) -> None:
+        self._aggregator = async_aggregator
+        self._round_repo = round_repository
+        self._storage = storage
+
+    async def submit_async_update(
+        self,
+        job_id: uuid.UUID,
+        tenant_id: str,
+        participant_id: uuid.UUID,
+        client_round: int,
+        update_uri: str,
+        num_samples: int,
+        metrics: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Accept a staleness-aware update and trigger aggregation if buffer full.
+
+        Args:
+            job_id: The federated job.
+            tenant_id: Tenant context.
+            participant_id: Submitting participant.
+            client_round: Round when the client started training.
+            update_uri: URI of the weight delta artifact.
+            num_samples: Number of training examples.
+            metrics: Training metrics from the client.
+
+        Returns:
+            Dict with aggregation_triggered and optional new_global_weights_uri.
+        """
+        import numpy as np  # noqa: PLC0415
+
+        # Load the weight delta from storage
+        local_weights: np.ndarray[Any, Any] = await self._storage.load_update(update_uri)
+
+        new_global = self._aggregator.add_update(
+            local_weights=local_weights,
+            num_examples=num_samples,
+            client_round=client_round,
+        )
+
+        result: dict[str, Any] = {
+            "aggregation_triggered": new_global is not None,
+            "current_round": self._aggregator.current_round,
+        }
+
+        if new_global is not None:
+            global_uri = await self._storage.save_model(
+                job_id=str(job_id),
+                round_number=self._aggregator.current_round,
+                parameters=[new_global],
+            )
+            result["new_global_weights_uri"] = global_uri
+            logger.info(
+                "Async aggregation triggered for job %s — round %d",
+                job_id,
+                self._aggregator.current_round,
+            )
+
+        return result
+
+    def get_current_weights(self) -> Any:
+        """Return the current global model weights from the async aggregator."""
+        return self._aggregator.get_global_weights()
+
+
+# ---------------------------------------------------------------------------
+# TEE Attestation Service (Gap #153)
+# ---------------------------------------------------------------------------
+
+
+class TEEAttestationService:
+    """Manage SGX attestation nonce issuance and quote verification.
+
+    Wraps TEEAttestationProtocol with tenant-scoped access control.
+    """
+
+    def __init__(self, attestation_adapter: TEEAttestationProtocol) -> None:
+        self._attestation = attestation_adapter
+
+    async def issue_nonce(
+        self,
+        job_id: str,
+        participant_id: str,
+        tenant_id: str,
+    ) -> str:
+        """Issue an anti-replay nonce for a participant attestation request.
+
+        Args:
+            job_id: The FL job requiring attestation.
+            participant_id: The participant requesting attestation.
+            tenant_id: Tenant context.
+
+        Returns:
+            Nonce string.
+        """
+        return await self._attestation.issue_nonce(
+            job_id=job_id,
+            participant_id=participant_id,
+            tenant_id=tenant_id,
+        )
+
+    async def process_quote(
+        self,
+        job_id: str,
+        participant_id: str,
+        raw_quote_b64: str,
+        tenant_id: str,
+    ) -> Any:
+        """Verify an SGX attestation quote and register the participant.
+
+        Args:
+            job_id: The FL job.
+            participant_id: The participant submitting the quote.
+            raw_quote_b64: Base64-encoded SGX QUOTE_t bytes.
+            tenant_id: Tenant context.
+
+        Returns:
+            Verified AttestationQuote object.
+        """
+        return await self._attestation.process_quote(
+            job_id=job_id,
+            participant_id=participant_id,
+            raw_quote_b64=raw_quote_b64,
+            tenant_id=tenant_id,
+        )
+
+    def is_attested(self, participant_id: str) -> bool:
+        """Check whether a participant has a current verified attestation.
+
+        Args:
+            participant_id: The participant to check.
+
+        Returns:
+            True if verified attestation exists.
+        """
+        return self._attestation.is_participant_attested(participant_id)

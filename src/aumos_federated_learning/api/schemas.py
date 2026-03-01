@@ -174,3 +174,140 @@ class ErrorResponse(BaseModel):
 
     error: str
     detail: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Simulation schemas (Gap #146)
+# ---------------------------------------------------------------------------
+
+
+class SimulationRequest(BaseModel):
+    """Request body for POST /fl/simulate."""
+
+    strategy: str = Field(default="fedavg", pattern="^(fedavg|fedprox|scaffold)$")
+    num_clients: int = Field(default=10, ge=2, le=1000)
+    num_rounds: int = Field(default=10, ge=1, le=200)
+    fraction_fit: float = Field(default=0.5, gt=0.0, le=1.0)
+    dp_epsilon: float | None = Field(default=None, gt=0.0)
+    fedprox_mu: float = Field(default=0.01, ge=0.0)
+
+
+class SimulationRoundMetrics(BaseModel):
+    """Per-round metrics from a simulation."""
+
+    round_number: int
+    distributed_loss: float
+    centralized_accuracy: float
+
+
+class SimulationResponse(BaseModel):
+    """Response schema for a completed FL simulation."""
+
+    simulation_id: str
+    strategy: str
+    num_rounds: int
+    num_clients: int
+    per_round_metrics: list[SimulationRoundMetrics]
+    final_accuracy: float
+
+
+# ---------------------------------------------------------------------------
+# Async update submission schemas (Gap #149)
+# ---------------------------------------------------------------------------
+
+
+class UpdateSubmissionRequest(BaseModel):
+    """Request body for POST /fl/jobs/{id}/updates (async update submission)."""
+
+    participant_id: uuid.UUID
+    client_round: int = Field(ge=0, description="Round when client started training")
+    update_uri: str = Field(min_length=1)
+    num_samples: int = Field(ge=1)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+
+class GlobalWeightsResponse(BaseModel):
+    """Response schema for GET /fl/jobs/{id}/global-weights."""
+
+    job_id: uuid.UUID
+    current_round: int
+    weights_uri: str
+    strategy: str
+    num_participants_aggregated: int
+
+
+# ---------------------------------------------------------------------------
+# Participant credentials (Gap #147)
+# ---------------------------------------------------------------------------
+
+
+class ParticipantCredentials(BaseModel):
+    """Credentials returned when an organization joins an FL job."""
+
+    participant_id: str
+    flower_server_address: str
+    tls_cert_pem: str | None = None
+    job_id: uuid.UUID
+
+
+# ---------------------------------------------------------------------------
+# Federated analytics schemas (Gap #152)
+# ---------------------------------------------------------------------------
+
+
+class AnalyticsQueryRequest(BaseModel):
+    """Request body for POST /fl/analytics/query."""
+
+    aggregation_type: str = Field(
+        pattern="^(count|sum|mean|variance|histogram)$",
+        description="Type of aggregate to compute",
+    )
+    column_name: str | None = Field(default=None, max_length=128)
+    bins: int | None = Field(default=10, ge=2, le=1000)
+    range_min: float | None = Field(default=0.0)
+    range_max: float | None = Field(default=1.0)
+    epsilon: float = Field(default=1.0, gt=0.0, description="DP budget epsilon for this query")
+
+
+class AnalyticsResultResponse(BaseModel):
+    """Response schema for a completed federated analytics query."""
+
+    aggregation_type: str
+    result: Any
+    total_count: int
+    num_participants: int
+    epsilon_consumed: float
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# TEE attestation schemas (Gap #153)
+# ---------------------------------------------------------------------------
+
+
+class AttestationNonceResponse(BaseModel):
+    """Response for GET /fl/attestation/nonce — issues anti-replay nonce."""
+
+    nonce: str
+    participant_id: str
+    job_id: uuid.UUID
+
+
+class AttestationQuoteRequest(BaseModel):
+    """Request body for POST /fl/attestation/verify."""
+
+    participant_id: str
+    job_id: uuid.UUID
+    raw_quote_b64: str = Field(
+        min_length=1, description="Base64-encoded Intel SGX QUOTE_t"
+    )
+
+
+class AttestationQuoteResponse(BaseModel):
+    """Response schema after SGX quote verification."""
+
+    participant_id: str
+    job_id: uuid.UUID
+    mrenclave: str
+    verified: bool
+    verification_metadata: dict[str, Any] = Field(default_factory=dict)

@@ -561,3 +561,97 @@ class FLDashboardProtocol(Protocol):
     ) -> dict[str, Any]:
         """Export a complete dashboard snapshot as a JSON-ready dict."""
         ...
+
+
+# ---------------------------------------------------------------------------
+# New protocols for gaps 149–153
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class AsyncAggregatorProtocol(Protocol):
+    """Protocol for asynchronous federated model update aggregation (Gap #149).
+
+    Supports FedAsync (Xie et al. 2019) and plain ASGD.
+    """
+
+    @property
+    def current_round(self) -> int:
+        """Return the current global round number."""
+        ...
+
+    def add_update(
+        self,
+        local_weights: np.ndarray[Any, Any],
+        num_examples: int,
+        client_round: int,
+    ) -> np.ndarray[Any, Any] | None:
+        """Add a participant update and optionally trigger aggregation.
+
+        Returns updated global weights if aggregation was triggered, else None.
+        """
+        ...
+
+    def get_global_weights(self) -> np.ndarray[Any, Any] | None:
+        """Return the current global model weights."""
+        ...
+
+    def reset(self) -> None:
+        """Reset aggregator state for a new job."""
+        ...
+
+
+@runtime_checkable
+class CompressionProtocol(Protocol):
+    """Protocol for communication compression of weight updates (Gap #150)."""
+
+    def compress(
+        self,
+        weights: np.ndarray[Any, Any],
+    ) -> tuple[np.ndarray[Any, Any], dict[str, Any]]:
+        """Compress a weight delta, returning (compressed_array, metadata)."""
+        ...
+
+    def decompress(
+        self,
+        compressed: np.ndarray[Any, Any],
+        metadata: dict[str, Any],
+    ) -> np.ndarray[Any, Any]:
+        """Decompress a weight delta using metadata from compression."""
+        ...
+
+
+@runtime_checkable
+class TEEAttestationProtocol(Protocol):
+    """Protocol for TEE/SGX attestation lifecycle management (Gap #153)."""
+
+    async def issue_nonce(
+        self,
+        job_id: str,
+        participant_id: str,
+        tenant_id: str,
+    ) -> str:
+        """Issue an anti-replay nonce for attestation.
+
+        Returns:
+            Nonce string to embed in SGX report data.
+        """
+        ...
+
+    async def process_quote(
+        self,
+        job_id: str,
+        participant_id: str,
+        raw_quote_b64: str,
+        tenant_id: str,
+    ) -> Any:
+        """Parse and verify an SGX attestation quote.
+
+        Returns:
+            Verified AttestationQuote object.
+        """
+        ...
+
+    def is_participant_attested(self, participant_id: str) -> bool:
+        """Return True if the participant has a verified attestation."""
+        ...

@@ -8,6 +8,12 @@ Endpoints:
     GET    /fl/jobs/{id}/rounds              — round history
     POST   /fl/jobs/{id}/rounds/{num}/submit — submit model update
     GET    /fl/jobs/{id}/model               — download aggregated model
+    POST   /fl/simulate                      — run in-process simulation (Gap #146)
+    POST   /fl/jobs/{id}/updates             — async update submission (Gap #149)
+    GET    /fl/jobs/{id}/global-weights      — retrieve current global model (Gap #149)
+    POST   /fl/analytics/query               — federated analytics query (Gap #152)
+    GET    /fl/attestation/nonce             — issue SGX attestation nonce (Gap #153)
+    POST   /fl/attestation/verify            — verify SGX quote (Gap #153)
 """
 
 from __future__ import annotations
@@ -18,16 +24,27 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 
 from aumos_federated_learning.api.schemas import (
+    AnalyticsQueryRequest,
+    AnalyticsResultResponse,
+    AttestationNonceResponse,
+    AttestationQuoteRequest,
+    AttestationQuoteResponse,
     CreateJobRequest,
+    GlobalWeightsResponse,
     JobResponse,
     JoinJobRequest,
     MessageResponse,
     ModelDownloadResponse,
+    ParticipantCredentials,
     ParticipantResponse,
     RoundListResponse,
     RoundResponse,
+    SimulationRequest,
+    SimulationResponse,
+    SimulationRoundMetrics,
     StartJobRequest,
     SubmitUpdateRequest,
+    UpdateSubmissionRequest,
 )
 
 router = APIRouter(prefix="/fl", tags=["federated-learning"])
@@ -54,6 +71,21 @@ def _get_training_service() -> Any:
     raise NotImplementedError("TrainingService not wired")
 
 
+def _get_simulation_service() -> Any:
+    """Provide SimulationService — override in production with proper DI."""
+    raise NotImplementedError("SimulationService not wired")
+
+
+def _get_analytics_service() -> Any:
+    """Provide FederatedAnalyticsService — override in production with proper DI."""
+    raise NotImplementedError("FederatedAnalyticsService not wired")
+
+
+def _get_attestation_service() -> Any:
+    """Provide TEEAttestationService — override in production with proper DI."""
+    raise NotImplementedError("TEEAttestationService not wired")
+
+
 def _get_current_tenant() -> str:
     """Extract tenant_id from request context — override with auth middleware."""
     return "default-tenant"
@@ -62,6 +94,9 @@ def _get_current_tenant() -> str:
 JobServiceDep = Annotated[Any, Depends(_get_job_service)]
 CoordinationServiceDep = Annotated[Any, Depends(_get_coordination_service)]
 TrainingServiceDep = Annotated[Any, Depends(_get_training_service)]
+SimulationServiceDep = Annotated[Any, Depends(_get_simulation_service)]
+AnalyticsServiceDep = Annotated[Any, Depends(_get_analytics_service)]
+AttestationServiceDep = Annotated[Any, Depends(_get_attestation_service)]
 TenantDep = Annotated[str, Depends(_get_current_tenant)]
 
 
@@ -266,4 +301,234 @@ async def get_model(
         strategy=job.strategy,
         dp_epsilon=job.dp_epsilon,
         dp_delta=job.dp_delta,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Simulation endpoint (Gap #146)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/simulate",
+    response_model=SimulationResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Run an in-process FL simulation",
+)
+async def run_simulation(
+    body: SimulationRequest,
+    simulation_service: SimulationServiceDep,
+    tenant_id: TenantDep,
+) -> SimulationResponse:
+    """Run a complete FL simulation in-process using Flower's simulation module.
+
+    No real participant connections or network setup required. Returns per-round
+    convergence metrics for strategy comparison.
+    """
+    try:
+        result = await simulation_service.run_simulation(
+            tenant_id=tenant_id,
+            strategy=body.strategy,
+            num_clients=body.num_clients,
+            num_rounds=body.num_rounds,
+            fraction_fit=body.fraction_fit,
+            dp_epsilon=body.dp_epsilon,
+            fedprox_mu=body.fedprox_mu,
+        )
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Simulation dependencies not installed: {exc}",
+        ) from exc
+
+    return SimulationResponse(
+        simulation_id=result.simulation_id,
+        strategy=result.strategy,
+        num_rounds=result.num_rounds,
+        num_clients=result.num_clients,
+        per_round_metrics=[
+            SimulationRoundMetrics(
+                round_number=m.round_number,
+                distributed_loss=m.distributed_loss,
+                centralized_accuracy=m.centralized_accuracy,
+            )
+            for m in result.per_round_metrics
+        ],
+        final_accuracy=result.final_accuracy,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Async update submission and global weights (Gap #149)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/jobs/{job_id}/updates",
+    response_model=MessageResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Submit an asynchronous model update",
+)
+async def submit_async_update(
+    job_id: Annotated[uuid.UUID, Path(description="Federated job ID")],
+    body: UpdateSubmissionRequest,
+    training_service: TrainingServiceDep,
+    tenant_id: TenantDep,
+) -> MessageResponse:
+    """Submit a model update asynchronously, without waiting for all participants.
+
+    The server applies staleness-aware weighting (FedAsync) and triggers
+    aggregation once the buffer is full.
+    """
+    try:
+        await training_service.submit_async_update(
+            job_id=job_id,
+            tenant_id=tenant_id,
+            participant_id=body.participant_id,
+            client_round=body.client_round,
+            update_uri=body.update_uri,
+            num_samples=body.num_samples,
+            metrics=body.metrics,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return MessageResponse(message=f"Async update accepted for job {job_id}")
+
+
+@router.get(
+    "/jobs/{job_id}/global-weights",
+    response_model=GlobalWeightsResponse,
+    summary="Retrieve current global model weights URI",
+)
+async def get_global_weights(
+    job_id: Annotated[uuid.UUID, Path(description="Federated job ID")],
+    job_service: JobServiceDep,
+    tenant_id: TenantDep,
+) -> GlobalWeightsResponse:
+    """Return the current global model weights URI for asynchronous clients."""
+    job = await job_service.get_job(job_id=job_id, tenant_id=tenant_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.aggregated_model_uri is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No global model available yet — waiting for first aggregation",
+        )
+    return GlobalWeightsResponse(
+        job_id=job.id,
+        current_round=job.current_round,
+        weights_uri=job.aggregated_model_uri,
+        strategy=job.strategy,
+        num_participants_aggregated=job.actual_participants,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Federated analytics endpoint (Gap #152)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/analytics/query",
+    response_model=AnalyticsResultResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Run a federated analytics query with differential privacy",
+)
+async def run_analytics_query(
+    body: AnalyticsQueryRequest,
+    analytics_service: AnalyticsServiceDep,
+    tenant_id: TenantDep,
+) -> AnalyticsResultResponse:
+    """Compute a DP-protected aggregate statistic across FL participants.
+
+    Supported aggregation types: count, sum, mean, variance, histogram.
+    All results are protected by the Laplace mechanism with the specified epsilon.
+    """
+    try:
+        result = await analytics_service.run_query(
+            tenant_id=tenant_id,
+            aggregation_type=body.aggregation_type,
+            column_name=body.column_name,
+            bins=body.bins,
+            range_min=body.range_min,
+            range_max=body.range_max,
+            epsilon=body.epsilon,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
+    return AnalyticsResultResponse(
+        aggregation_type=result.aggregation_type.value,
+        result=result.result,
+        total_count=result.total_count,
+        num_participants=result.num_participants,
+        epsilon_consumed=result.epsilon_consumed,
+        metadata=result.metadata,
+    )
+
+
+# ---------------------------------------------------------------------------
+# TEE attestation endpoints (Gap #153)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/attestation/nonce",
+    response_model=AttestationNonceResponse,
+    summary="Issue an anti-replay nonce for SGX attestation",
+)
+async def get_attestation_nonce(
+    job_id: Annotated[uuid.UUID, Query(description="FL job requiring attestation")],
+    participant_id: Annotated[str, Query(min_length=1)],
+    attestation_service: AttestationServiceDep,
+    tenant_id: TenantDep,
+) -> AttestationNonceResponse:
+    """Issue a fresh nonce that the participant must embed in their SGX report data."""
+    nonce = await attestation_service.issue_nonce(
+        job_id=str(job_id),
+        participant_id=participant_id,
+        tenant_id=tenant_id,
+    )
+    return AttestationNonceResponse(
+        nonce=nonce,
+        participant_id=participant_id,
+        job_id=job_id,
+    )
+
+
+@router.post(
+    "/attestation/verify",
+    response_model=AttestationQuoteResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Verify an Intel SGX attestation quote",
+)
+async def verify_attestation_quote(
+    body: AttestationQuoteRequest,
+    attestation_service: AttestationServiceDep,
+    tenant_id: TenantDep,
+) -> AttestationQuoteResponse:
+    """Verify a participant's SGX attestation quote.
+
+    On success, the participant is added to the attested allowlist for the job.
+    Only attested participants may receive global model weights in TEE-enforced jobs.
+    """
+    try:
+        quote = await attestation_service.process_quote(
+            job_id=str(body.job_id),
+            participant_id=body.participant_id,
+            raw_quote_b64=body.raw_quote_b64,
+            tenant_id=tenant_id,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Attestation verification failed: {exc}",
+        ) from exc
+
+    return AttestationQuoteResponse(
+        participant_id=body.participant_id,
+        job_id=body.job_id,
+        mrenclave=quote.mrenclave,
+        verified=quote.verified,
+        verification_metadata=quote.verification_metadata,
     )
